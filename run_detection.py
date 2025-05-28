@@ -17,71 +17,141 @@ from ultralytics import YOLO  # YOLOv8 implementation
 import sys  # System-specific parameters and functions
 import os  # Operating system interface
 import time  # For FPS calculation
+from collections import deque
 
 # --------- CONFIGURATION ---------
 MODEL_PATH = 'yolov8n.pt'  # Path to YOLO model (will auto-download if not present)
 IMAGE_PATH = 'data/sample.jpg'  # Default path for image detection
 USE_WEBCAM = True  # Flag to toggle between webcam and image detection
-CONFIDENCE_THRESHOLD = 0.25  # Minimum confidence score for detections
+CONFIDENCE_THRESHOLD = 0.45  # Minimum confidence score for detections
 CAMERA_ID = 0  # Default camera ID (usually 0 for built-in webcam)
 
 # Color configurations
 RECTANGLE_COLOR = (255, 255, 255)  # White color for rectangle (BGR format)
 TEXT_COLOR = (0, 255, 255)  # Yellow color for text (BGR format)
 
+# Custom object mapping for similar objects
+OBJECT_MAPPING = {
+    'toothbrush': 'bottle',  # Map toothbrush to bottle when confidence is low
+    'wine glass': 'bottle',  # Map wine glass to bottle when confidence is low
+}
+
+# Smoothing parameters for bounding boxes
+SMOOTHING_WINDOW = 5  # Number of frames to average for smoothing
+box_history = {}  # Dictionary to store box history for each object
+
 # --------- HELPER FUNCTIONS ---------
-def draw_detections(image, results, fps=None):
+def smooth_boxes(detections, frame_shape):
     """
-    Draw bounding boxes and labels on the image using YOLO detection results.
+    Apply temporal smoothing to bounding boxes to reduce jitter.
     
     Args:
-        image (numpy.ndarray): Input image to draw on
-        results (ultralytics.engine.results.Results): YOLO detection results
-        fps (float, optional): Frames per second to display
-        
-    Returns:
-        numpy.ndarray: Image with drawn detections
-        
-    Process:
-    1. Draw FPS counter if provided
-    2. Process each detection:
-       - Filter by confidence threshold
-       - Extract bounding box coordinates
-       - Get class name and confidence
-       - Draw rectangle and label
-    """
-    # Draw FPS counter in top-left corner
-    if fps is not None:
-        cv2.putText(image, f"FPS: {fps:.1f}", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, TEXT_COLOR, 2)
+        detections: List of detection results
+        frame_shape: Shape of the current frame
     
-    # Process each detected object
-    for box in results.boxes:
-        # Get confidence score for this detection
-        conf = float(box.conf[0])
+    Returns:
+        List of smoothed detection results
+    """
+    global box_history
+    
+    current_boxes = {}
+    smoothed_detections = []
+    
+    # Process current detections
+    for det in detections:
+        for box in det.boxes:
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
+            xyxy = box.xyxy[0].cpu().numpy()
+            
+            # Apply custom mapping for low confidence detections
+            if conf < 0.6:  # Lower threshold for mapping
+                cls_name = det.names[cls]
+                if cls_name in OBJECT_MAPPING:
+                    # Find the mapped class ID
+                    for id, name in det.names.items():
+                        if name == OBJECT_MAPPING[cls_name]:
+                            cls = id
+                            break
+            
+            # Initialize history for new objects
+            if cls not in box_history:
+                box_history[cls] = deque(maxlen=SMOOTHING_WINDOW)
+            
+            # Add current box to history
+            box_history[cls].append(xyxy)
+            
+            # Calculate smoothed box coordinates
+            if len(box_history[cls]) > 0:
+                smoothed_box = np.mean(box_history[cls], axis=0)
+                # Ensure box stays within frame boundaries
+                smoothed_box[0] = max(0, min(smoothed_box[0], frame_shape[1]))
+                smoothed_box[1] = max(0, min(smoothed_box[1], frame_shape[0]))
+                smoothed_box[2] = max(0, min(smoothed_box[2], frame_shape[1]))
+                smoothed_box[3] = max(0, min(smoothed_box[3], frame_shape[0]))
+                
+                # Store smoothed box
+                current_boxes[cls] = smoothed_box
+                smoothed_detections.append((cls, smoothed_box, conf, det.names[cls]))
+    
+    # Clean up old boxes
+    for cls in list(box_history.keys()):
+        if cls not in current_boxes:
+            box_history.pop(cls, None)
+    
+    return smoothed_detections
+
+def draw_detections(frame, detections, fps=None):
+    """
+    Draw bounding boxes and labels on the frame.
+    
+    Args:
+        frame: Input frame
+        detections: List of detection results
+        fps: Optional FPS value to display
+    
+    Returns:
+        Frame with drawn detections
+    """
+    # Define colors for different classes (BGR format)
+    colors = {
+        'person': (0, 255, 0),    # Green
+        'bottle': (255, 0, 0),    # Blue
+        'cell phone': (0, 0, 255), # Red
+        'chair': (255, 255, 0),   # Cyan
+        'dining table': (0, 255, 255), # Yellow
+        'toothbrush': (255, 0, 0), # Blue (same as bottle)
+        'wine glass': (255, 0, 0), # Blue (same as bottle)
+    }
+    
+    # Draw each detection
+    for cls, xyxy, conf, cls_name in detections:
+        # Get color for this class
+        color = colors.get(cls_name, (255, 255, 255))  # Default to white if class not in colors
         
-        # Only process detections above threshold
-        if conf > CONFIDENCE_THRESHOLD:
-            # Extract bounding box coordinates (x1, y1, x2, y2)
-            # These represent the top-left and bottom-right corners
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            
-            # Get class ID and convert to class name
-            class_id = int(box.cls[0])
-            class_name = results.names[class_id]
-            
-            # Create label with class name and confidence score
-            label = f"{class_name}: {conf:.2f}"
-            
-            # Draw white rectangle around detected object
-            # Parameters: image, (x1,y1), (x2,y2), color(BGR), thickness
-            cv2.rectangle(image, (x1, y1), (x2, y2), RECTANGLE_COLOR, 2)
-            
-            # Draw yellow label above the rectangle
-            # Parameters: image, text, position, font, scale, color, thickness
-            cv2.putText(image, label, (x1, y1 - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_COLOR, 2)
-    return image
+        # Draw box
+        cv2.rectangle(frame, 
+                     (int(xyxy[0]), int(xyxy[1])), 
+                     (int(xyxy[2]), int(xyxy[3])), 
+                     color, 2)
+        
+        # Draw label
+        label = f"{cls_name} {conf:.2f}"
+        (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        cv2.rectangle(frame, 
+                     (int(xyxy[0]), int(xyxy[1] - label_height - 10)), 
+                     (int(xyxy[0] + label_width), int(xyxy[1])), 
+                     color, -1)
+        cv2.putText(frame, label, 
+                    (int(xyxy[0]), int(xyxy[1] - 5)), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    # Draw FPS if provided
+    if fps is not None:
+        cv2.putText(frame, f"FPS: {fps:.1f}", 
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    
+    return frame
 
 def detect_on_webcam(model):
     """
@@ -101,7 +171,7 @@ def detect_on_webcam(model):
     4. Clean up resources
     """
     # Initialize webcam capture with MacBook camera
-    cap = cv2.VideoCapture(0)  # Use default camera (MacBook camera)
+    cap = cv2.VideoCapture(CAMERA_ID)
     if not cap.isOpened():
         print("Error: Could not open MacBook camera.")
         return
@@ -134,20 +204,18 @@ def detect_on_webcam(model):
             start_time = time.time()
             
         # Perform detection on frame
-        # The model automatically handles:
-        # - Image preprocessing
-        # - Model inference
-        # - Post-processing
-        results = model(frame)
+        results = model(frame, conf=CONFIDENCE_THRESHOLD)
+        
+        # Apply smoothing to reduce jitter
+        smoothed_results = smooth_boxes(results, frame.shape)
         
         # Draw detection results with FPS
-        frame = draw_detections(frame, results[0], fps)
+        frame = draw_detections(frame, smoothed_results, fps)
         
         # Display results
         cv2.imshow('YOLO Detection - MacBook Camera', frame)
         
         # Break loop if 'q' is pressed
-        # waitKey(1) means wait for 1ms for a key press
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
     
@@ -179,8 +247,17 @@ def detect_on_image(model, image_path):
     # Perform detection
     results = model(image)
     
+    # Process detections
+    detections = []
+    for det in results:
+        for box in det.boxes:
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
+            xyxy = box.xyxy[0].cpu().numpy()
+            detections.append((cls, xyxy, conf, det.names[cls]))
+    
     # Draw detection results on image
-    image = draw_detections(image, results[0])
+    image = draw_detections(image, detections)
     
     # Display results
     cv2.imshow('YOLO Detection - Image', image)
